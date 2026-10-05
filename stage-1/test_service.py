@@ -1,4 +1,5 @@
 import concurrent.futures
+import copy
 import http.client
 import json
 import threading
@@ -69,6 +70,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/_test/reset", {"users": [], "restaurants": [], "reservations": []})[0], 204)
         self.assertEqual(self.request("POST", "/_test/import", exported)[0], 204)
         self.assertEqual(self.request("POST", "/reservations", body, auth), (200, first))
+
+    def test_invalid_import_is_rejected_without_replacing_state(self):
+        token, day = self.fixture()
+        auth = {"Authorization": "Bearer " + token}
+        booking = {"restaurant_id": "r", "table_id": "t1", "starts_at_local": day + "T18:00", "party_size": 2}
+        self.assertEqual(self.request("POST", "/reservations", booking, {**auth, "Idempotency-Key": "preserve"})[0], 201)
+        _, snapshot = self.request("GET", "/_test/export")
+        malformed = copy.deepcopy(snapshot)
+        del malformed["state"]["restaurants"]["r"]["slot_minutes"]
+        del malformed["state"]["restaurants"]["r"]["tables"][0]["capacity"]
+        status, error = self.request("POST", "/_test/import", malformed)
+        self.assertEqual((status, error["error"]["code"]), (422, "validation_failed"))
+        self.assertEqual(self.request("GET", "/restaurants/r")[1]["slot_minutes"], 30)
+        self.assertEqual(len(self.request("GET", "/reservations", headers=auth)[1]["reservations"]), 1)
 
     def test_half_open_and_concurrent_writes(self):
         token, day = self.fixture()

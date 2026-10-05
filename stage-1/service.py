@@ -507,19 +507,89 @@ def import_state(obj):
     for rid, restaurant in raw["restaurants"].items():
         if not isinstance(restaurant, dict) or validate_id(rid) != rid or restaurant.get("id") != rid:
             fail(422, "validation_failed")
-        ZoneInfo(restaurant["timezone"])
-        if not isinstance(restaurant.get("tables"), list) or not isinstance(restaurant.get("opening_hours"), list):
+        if not isinstance(restaurant.get("name"), str) or not isinstance(restaurant.get("timezone"), str):
             fail(422, "validation_failed")
+        ZoneInfo(restaurant["timezone"])
+        for field in ("slot_minutes", "reservation_duration_minutes", "cancellation_cutoff_minutes"):
+            value = restaurant.get(field)
+            if type(value) is not int or value < (0 if field == "cancellation_cutoff_minutes" else 1):
+                fail(422, "validation_failed")
+        hours = restaurant.get("opening_hours")
+        tables = restaurant.get("tables")
+        if not isinstance(hours, list) or not isinstance(tables, list):
+            fail(422, "validation_failed")
+        seen_days = set()
+        for entry in hours:
+            if not isinstance(entry, dict) or entry.get("weekday") not in WEEK or not isinstance(entry.get("opens"), str) or not isinstance(entry.get("closes"), str):
+                fail(422, "validation_failed")
+            if not re.fullmatch(r"\d{2}:\d{2}", entry["opens"]) or not re.fullmatch(r"\d{2}:\d{2}", entry["closes"]):
+                fail(422, "validation_failed")
+            opens, closes = time.fromisoformat(entry["opens"]), time.fromisoformat(entry["closes"])
+            if opens >= closes or entry["weekday"] in seen_days:
+                fail(422, "validation_failed")
+            seen_days.add(entry["weekday"])
+        seen_tables = set()
+        for table in tables:
+            if not isinstance(table, dict):
+                fail(422, "validation_failed")
+            tid = validate_id(table.get("id"))
+            if tid in seen_tables or not isinstance(table.get("label"), str) or type(table.get("capacity")) is not int or table["capacity"] < 1:
+                fail(422, "validation_failed")
+            seen_tables.add(tid)
     refs = set()
     for key, res in raw["reservations"].items():
         if not isinstance(res, dict) or validate_id(key) != key or res.get("reservation_id") != key:
             fail(422, "validation_failed")
         if res.get("user_id") not in raw["users"] or res.get("restaurant_id") not in raw["restaurants"] or res.get("status") not in ("confirmed", "cancelled"):
             fail(422, "validation_failed")
+        restaurant = raw["restaurants"][res["restaurant_id"]]
+        table = next((t for t in restaurant["tables"] if t["id"] == res.get("table_id")), None)
+        if table is None or type(res.get("party_size")) is not int or not 1 <= res["party_size"] <= table["capacity"]:
+            fail(422, "validation_failed")
+        required_strings = ("starts_at_local", "starts_at", "ends_at", "created_at")
+        if not all(isinstance(res.get(k), str) for k in required_strings):
+            fail(422, "validation_failed")
+        zone = ZoneInfo(restaurant["timezone"])
+        try:
+            local, expected_start = local_parse(res["starts_at_local"], zone)
+        except ApiError:
+            fail(422, "validation_failed")
+        opening = restaurant_hours(restaurant, local)
+        if opening is None or local.time() < opening[0] or local.time() >= opening[1] or ((local.hour * 60 + local.minute) - (opening[0].hour * 60 + opening[0].minute)) % restaurant["slot_minutes"]:
+            fail(422, "validation_failed")
+        try:
+            actual_start = datetime.fromisoformat(res["starts_at"])
+            actual_end = datetime.fromisoformat(res["ends_at"])
+            created_at = datetime.fromisoformat(res["created_at"])
+            if actual_start.tzinfo is None or actual_end.tzinfo is None or created_at.tzinfo is None:
+                fail(422, "validation_failed")
+            expected_end = expected_start.astimezone(timezone.utc) + timedelta(minutes=restaurant["reservation_duration_minutes"])
+            expected_end_local = expected_end.astimezone(zone)
+            if (actual_start.astimezone(timezone.utc) != expected_start.astimezone(timezone.utc)
+                    or actual_start.utcoffset() != expected_start.utcoffset()
+                    or actual_end.astimezone(timezone.utc) != expected_end
+                    or actual_end.utcoffset() != expected_end_local.utcoffset()
+                    or expected_end_local.date() != local.date()
+                    or expected_end_local.time().replace(tzinfo=None) > opening[1]):
+                fail(422, "validation_failed")
+        except (TypeError, ValueError, OverflowError):
+            fail(422, "validation_failed")
         ref = res.get("reference")
         if not isinstance(ref, str) or not re.fullmatch(r"[A-Z0-9]{6,12}", ref) or ref in refs:
             fail(422, "validation_failed")
         refs.add(ref)
+    confirmed = [r for r in raw["reservations"].values() if r["status"] == "confirmed"]
+    for index, left in enumerate(confirmed):
+        left_start = datetime.fromisoformat(left["starts_at"]).astimezone(timezone.utc)
+        duration = raw["restaurants"][left["restaurant_id"]]["reservation_duration_minutes"]
+        left_end = left_start + timedelta(minutes=duration)
+        for right in confirmed[index + 1:]:
+            if left["restaurant_id"] != right["restaurant_id"] or left["table_id"] != right["table_id"]:
+                continue
+            right_start = datetime.fromisoformat(right["starts_at"]).astimezone(timezone.utc)
+            right_duration = raw["restaurants"][right["restaurant_id"]]["reservation_duration_minutes"]
+            if left_start < right_start + timedelta(minutes=right_duration) and right_start < left_end:
+                fail(422, "validation_failed")
     for token, uid in raw["tokens"].items():
         if not isinstance(token, str) or uid not in raw["users"]: fail(422, "validation_failed")
     for key, receipt in raw["idempotency"].items():
